@@ -1,0 +1,443 @@
+import {
+  and,
+  asc,
+  count,
+  type DatabaseClient,
+  db,
+  eq,
+  ilike,
+  inArray,
+  isNull,
+  ne,
+  or,
+  sql,
+} from "@chatbotx.io/database/client"
+import {
+  integrationMetaCatalogModel,
+  metaCatalogItemModel,
+  productModel,
+} from "@chatbotx.io/database/schema"
+import {
+  getPaginationWithDefaults,
+  likeContains,
+} from "@chatbotx.io/database/utils"
+import { createId } from "@chatbotx.io/utils"
+
+/** Keeps a single "type to search" list from ever returning an unbounded page. */
+const DEFAULT_SEARCH_LIMIT = 20
+
+/**
+ * Every lookup is scoped to a single catalog. Rebinding a connection to another
+ * catalog must not resurrect links from the previous one — treating those as
+ * existing would send Meta an UPDATE for an item that was never created there.
+ */
+type CatalogScope = {
+  integrationMetaCatalogId: string
+  catalogId: string
+}
+
+const inCatalog = (scope: CatalogScope) =>
+  and(
+    eq(
+      metaCatalogItemModel.integrationMetaCatalogId,
+      scope.integrationMetaCatalogId,
+    ),
+    eq(metaCatalogItemModel.catalogId, scope.catalogId),
+  )
+
+/** Catalog item rows joined to their product and catalog connection; the caller adds the where. */
+const selectLinkedProducts = (tx: DatabaseClient) =>
+  tx
+    .select(sendableProductColumns())
+    .from(metaCatalogItemModel)
+    .innerJoin(
+      productModel,
+      eq(metaCatalogItemModel.productId, productModel.id),
+    )
+    .innerJoin(
+      integrationMetaCatalogModel,
+      eq(
+        metaCatalogItemModel.integrationMetaCatalogId,
+        integrationMetaCatalogModel.id,
+      ),
+    )
+
+/**
+ * A product linked in the connection's current catalog and owned by the
+ * workspace. The connection row is joined so a disconnect or rebind that lands
+ * after the caller read its scope cannot resolve against the catalog it left.
+ * The workspace check is explicit rather than implied by the connection, so a
+ * product id lifted from another workspace's flow can never resolve.
+ */
+const linkedProductWhere = (input: CatalogScope & { workspaceId: string }) =>
+  and(
+    inCatalog(input),
+    eq(integrationMetaCatalogModel.workspaceId, input.workspaceId),
+    eq(integrationMetaCatalogModel.catalogId, input.catalogId),
+    isNull(integrationMetaCatalogModel.deletedAt),
+    eq(productModel.workspaceId, input.workspaceId),
+  )
+
+/** A linked product a contact can be sent: it must also still be active. */
+const sendableProductWhere = (
+  input: CatalogScope & {
+    workspaceId: string
+    keyword?: string
+    productIds?: string[]
+  },
+) =>
+  and(
+    linkedProductWhere(input),
+    eq(productModel.isActive, true),
+    input.keyword
+      ? ilike(productModel.name, likeContains(input.keyword))
+      : undefined,
+    input.productIds
+      ? inArray(metaCatalogItemModel.productId, input.productIds)
+      : undefined,
+  )
+
+const sendableProductColumns = () => ({
+  productId: productModel.id,
+  retailerId: metaCatalogItemModel.retailerId,
+  catalogId: metaCatalogItemModel.catalogId,
+  name: productModel.name,
+  images: productModel.images,
+  price: productModel.price,
+  currency: productModel.currency,
+})
+
+/**
+ * `linkImported` and `markSucceeded` both call this before writing, so every
+ * write is safe on its own regardless of what the caller already holds.
+ * `pg_advisory_xact_lock` is re-entrant per transaction, so a caller that
+ * needs the lock held across a read-then-write sequence (see `importPage`)
+ * can also take it upfront without this becoming a double-lock bug.
+ */
+const lockCatalogAssignments = async (
+  scope: CatalogScope,
+  tx: DatabaseClient,
+): Promise<void> => {
+  const lockKey = `${scope.integrationMetaCatalogId}:${scope.catalogId}`
+  await tx.execute(
+    sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`,
+  )
+}
+
+/**
+ * A product's retailerId can legitimately change between syncs — a SKU gets
+ * added, removed, or reused by another product — and the two callers that
+ * assign one (`resolveRetailerIds` at submit time, a Meta import page pulled
+ * independently) can each work from a snapshot that's since gone stale: a push
+ * run's own poll can take minutes, and an import isn't blocked from running
+ * while a push is in flight. Either write's `onConflictDoUpdate` only reconciles
+ * against the retailerId-scoped unique index, so a row still parked under a
+ * product's *old* retailerId is invisible to that arbiter and collides with the
+ * productId-scoped index instead. Clearing those stale rows first keeps one row
+ * per productId per catalog regardless of which side raced ahead.
+ */
+const clearStaleProductLinks = async (
+  scope: CatalogScope & {
+    items: Array<{ productId: string; retailerId: string }>
+  },
+  tx: DatabaseClient,
+) => {
+  await tx
+    .delete(metaCatalogItemModel)
+    .where(
+      and(
+        inCatalog(scope),
+        or(
+          ...scope.items.flatMap((item) => [
+            and(
+              eq(metaCatalogItemModel.productId, item.productId),
+              ne(metaCatalogItemModel.retailerId, item.retailerId),
+            ),
+            and(
+              eq(metaCatalogItemModel.retailerId, item.retailerId),
+              ne(metaCatalogItemModel.productId, item.productId),
+            ),
+          ]),
+        ),
+      ),
+    )
+}
+
+export const metaCatalogItemRepository = {
+  lockCatalogAssignments,
+
+  /**
+   * The catalog a product most recently took part in. Products can be linked to
+   * more than one catalog over time — the newest sync is the one worth showing,
+   * and rows created by an import carry no `lastSyncedAt`, so creation time is
+   * the tiebreaker.
+   */
+  async findLatestByProductId(productId: string, tx: DatabaseClient = db) {
+    const [row] = await tx
+      .select({
+        catalogId: metaCatalogItemModel.catalogId,
+        retailerId: metaCatalogItemModel.retailerId,
+        direction: metaCatalogItemModel.direction,
+        lastSyncedAt: metaCatalogItemModel.lastSyncedAt,
+      })
+      .from(metaCatalogItemModel)
+      .where(eq(metaCatalogItemModel.productId, productId))
+      // `nulls last` matters: an imported row has never been pushed, so its null
+      // must not outrank a row that really was synced.
+      .orderBy(
+        sql`${metaCatalogItemModel.lastSyncedAt} desc nulls last`,
+        sql`${metaCatalogItemModel.createdAt} desc`,
+      )
+      .limit(1)
+    return row
+  },
+
+  async findByRetailerIds(
+    input: CatalogScope & { retailerIds: string[] },
+    tx: DatabaseClient = db,
+  ) {
+    if (input.retailerIds.length === 0) {
+      return []
+    }
+    return await tx
+      .select()
+      .from(metaCatalogItemModel)
+      .where(
+        and(
+          inCatalog(input),
+          inArray(metaCatalogItemModel.retailerId, input.retailerIds),
+        ),
+      )
+  },
+
+  /**
+   * Workspace-scoped product picker for template button params (catalog
+   * thumbnail, MPM sections): every linked item in the connection's current
+   * catalog, optionally name-filtered, joined to `Product` for the display
+   * name and image the picker needs. Never returns a bare `retailerId` — the
+   * picker's whole point is that the end user never has to type one.
+   */
+  async searchWithProductInfo(
+    input: CatalogScope & {
+      keyword?: string
+      /** Exactly this item, e.g. to show a saved pick by name. */
+      retailerId?: string
+      limit?: number
+    },
+    tx: DatabaseClient = db,
+  ) {
+    const limit = input.limit ?? DEFAULT_SEARCH_LIMIT
+    return await tx
+      .select({
+        retailerId: metaCatalogItemModel.retailerId,
+        name: productModel.name,
+        images: productModel.images,
+      })
+      .from(metaCatalogItemModel)
+      .innerJoin(
+        productModel,
+        eq(metaCatalogItemModel.productId, productModel.id),
+      )
+      .where(
+        and(
+          inCatalog(input),
+          input.keyword
+            ? ilike(productModel.name, likeContains(input.keyword))
+            : undefined,
+          input.retailerId
+            ? eq(metaCatalogItemModel.retailerId, input.retailerId)
+            : undefined,
+        ),
+      )
+      .orderBy(asc(productModel.name))
+      .limit(limit)
+  },
+
+  /**
+   * One page of products that can be sent, for the flow step's product picker.
+   * Same scoping as `findSendableByProductIds`, so what the picker offers is
+   * exactly what a send can resolve.
+   */
+  async listSendableProducts(
+    input: CatalogScope & {
+      workspaceId: string
+      keyword?: string
+      /** Only these products — how a picker names the ones a step already holds. */
+      productIds?: string[]
+      page?: number
+      perPage?: number
+    },
+    tx: DatabaseClient = db,
+  ) {
+    // An empty id list means "none of these", not "no filter".
+    if (input.productIds?.length === 0) {
+      return { data: [], pageCount: 0 }
+    }
+    const pagination = getPaginationWithDefaults(input)
+    const where = sendableProductWhere(input)
+    const [rows, [totals]] = await Promise.all([
+      selectLinkedProducts(tx)
+        .where(where)
+        .orderBy(asc(productModel.name), asc(productModel.id))
+        .limit(pagination.limit)
+        .offset(pagination.offset),
+      tx
+        .select({ total: count() })
+        .from(metaCatalogItemModel)
+        .innerJoin(
+          productModel,
+          eq(metaCatalogItemModel.productId, productModel.id),
+        )
+        .innerJoin(
+          integrationMetaCatalogModel,
+          eq(
+            metaCatalogItemModel.integrationMetaCatalogId,
+            integrationMetaCatalogModel.id,
+          ),
+        )
+        .where(where),
+    ])
+
+    return {
+      data: rows,
+      pageCount: Math.ceil((totals?.total ?? 0) / pagination.limit),
+    }
+  },
+
+  /**
+   * Resolves flow-step product ids to what a send needs, in one query. Ids that
+   * are not sendable (missing, other workspace, inactive, not in the current
+   * catalog) are simply absent from the result — the caller reports them.
+   */
+  async findSendableByProductIds(
+    input: CatalogScope & { workspaceId: string; productIds: string[] },
+    tx: DatabaseClient = db,
+  ) {
+    if (input.productIds.length === 0) {
+      return []
+    }
+    return await selectLinkedProducts(tx).where(sendableProductWhere(input))
+  },
+
+  /**
+   * Names the catalog items a contact sent back (a cart, a product question)
+   * with one query. Unlike a send, an inactive product still resolves: the
+   * contact referred to it, so it must be identifiable. Ids that are not linked
+   * in this workspace's current catalog are simply absent from the result.
+   */
+  async findLinkedProductsByRetailerIds(
+    input: CatalogScope & { workspaceId: string; retailerIds: string[] },
+    tx: DatabaseClient = db,
+  ) {
+    if (input.retailerIds.length === 0) {
+      return []
+    }
+    return await selectLinkedProducts(tx).where(
+      and(
+        linkedProductWhere(input),
+        inArray(metaCatalogItemModel.retailerId, input.retailerIds),
+      ),
+    )
+  },
+
+  async findByProductIds(
+    input: CatalogScope & { productIds: string[] },
+    tx: DatabaseClient = db,
+  ) {
+    if (input.productIds.length === 0) {
+      return []
+    }
+    return await tx
+      .select()
+      .from(metaCatalogItemModel)
+      .where(
+        and(
+          inCatalog(input),
+          inArray(metaCatalogItemModel.productId, input.productIds),
+        ),
+      )
+  },
+
+  async linkImported(
+    input: CatalogScope & {
+      items: Array<{ productId: string; retailerId: string }>
+    },
+    tx: DatabaseClient,
+  ) {
+    if (input.items.length === 0) {
+      return
+    }
+    await lockCatalogAssignments(input, tx)
+    await clearStaleProductLinks(input, tx)
+    await tx
+      .insert(metaCatalogItemModel)
+      .values(
+        input.items.map((item) => ({
+          id: createId(),
+          integrationMetaCatalogId: input.integrationMetaCatalogId,
+          catalogId: input.catalogId,
+          direction: "import" as const,
+          productId: item.productId,
+          retailerId: item.retailerId,
+        })),
+      )
+      .onConflictDoUpdate({
+        target: [
+          metaCatalogItemModel.integrationMetaCatalogId,
+          metaCatalogItemModel.catalogId,
+          metaCatalogItemModel.retailerId,
+        ],
+        set: {
+          productId: sql`excluded."productId"`,
+          direction: sql`excluded."direction"`,
+        },
+      })
+  },
+
+  async markSucceeded(
+    input: CatalogScope & {
+      items: Array<{
+        productId: string
+        retailerId: string
+        fingerprint: string
+      }>
+    },
+    tx: DatabaseClient,
+  ) {
+    if (input.items.length === 0) {
+      return
+    }
+    const syncedAt = new Date()
+    await lockCatalogAssignments(input, tx)
+    await clearStaleProductLinks(input, tx)
+    await tx
+      .insert(metaCatalogItemModel)
+      .values(
+        input.items.map((item) => ({
+          id: createId(),
+          integrationMetaCatalogId: input.integrationMetaCatalogId,
+          catalogId: input.catalogId,
+          direction: "push" as const,
+          productId: item.productId,
+          retailerId: item.retailerId,
+          lastSyncedFingerprint: item.fingerprint,
+          lastSyncedAt: syncedAt,
+        })),
+      )
+      .onConflictDoUpdate({
+        target: [
+          metaCatalogItemModel.integrationMetaCatalogId,
+          metaCatalogItemModel.catalogId,
+          metaCatalogItemModel.retailerId,
+        ],
+        set: {
+          productId: sql`excluded."productId"`,
+          // An imported product that is later pushed back up is a push from
+          // then on — the newest sync is what the history should report.
+          direction: sql`excluded."direction"`,
+          lastSyncedFingerprint: sql`excluded."lastSyncedFingerprint"`,
+          lastSyncedAt: syncedAt,
+        },
+      })
+  },
+}

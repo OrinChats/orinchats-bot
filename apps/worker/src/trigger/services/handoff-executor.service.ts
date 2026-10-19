@@ -1,0 +1,115 @@
+import {
+  BOT_DISABLE_DURATION_MS,
+  sqlDropQuickReplyChallenge,
+} from "@chatbotx.io/business"
+import { smartDelayService } from "@chatbotx.io/business/smart-delay"
+import { and, db, eq } from "@chatbotx.io/database/client"
+import { conversationModel } from "@chatbotx.io/database/schema"
+import { emit } from "@chatbotx.io/event-bus"
+import { emitConversationTransferredToHuman } from "@chatbotx.io/events"
+import baseLogger from "@chatbotx.io/logger"
+import { normalizeError } from "universal-error-normalizer"
+
+export interface HandoffRequest {
+  channel?: string
+  contactId: string
+  conversationId: string
+  inboxId?: string
+  metadata?: Record<string, unknown>
+  reason: string
+  source:
+    | "ai_system_tool"
+    | "automated_response"
+    | "global_router"
+    | "manual"
+    | "thread_control_handback"
+  workspaceId: string
+}
+
+export class HandoffExecutorService {
+  async execute(
+    request: HandoffRequest,
+  ): Promise<{ status: "alreadyHandedOff" | "handedOff" }> {
+    const {
+      workspaceId,
+      conversationId,
+      reason,
+      source,
+      channel,
+      inboxId,
+      metadata,
+      contactId,
+    } = request
+
+    try {
+      // Atomic update acts as idempotency guard: only proceeds when bot is still enabled.
+      // Using WHERE botEnabled = true eliminates the TOCTOU race between a separate check and update.
+      const updated = await db
+        .update(conversationModel)
+        .set({
+          botEnabled: false,
+          botResumeAt: new Date(Date.now() + BOT_DISABLE_DURATION_MS),
+          additionalAttributes: sqlDropQuickReplyChallenge(),
+        })
+        .where(
+          and(
+            eq(conversationModel.id, conversationId),
+            eq(conversationModel.botEnabled, true),
+          ),
+        )
+        .returning({ id: conversationModel.id })
+
+      if (updated.length === 0) {
+        return { status: "alreadyHandedOff" }
+      }
+
+      // Best-effort: the handoff is already committed, so a failed cancel must
+      // not skip the transfer events (a retry would hit the botEnabled guard).
+      try {
+        await smartDelayService.cancelQuickReplyFollowUps({
+          workspaceId,
+          conversationIds: [conversationId],
+        })
+      } catch (err) {
+        baseLogger.warn(
+          { err, conversationId },
+          "[handoff-executor] Failed to cancel quick reply follow-ups",
+        )
+      }
+
+      await emitConversationTransferredToHuman(
+        workspaceId,
+        contactId,
+        conversationId,
+      )
+
+      emit("analytics:dashboard", {
+        eventType: "conversation:transferred_to_human",
+        workspaceId,
+        conversationId,
+        channel,
+        inboxId,
+        occurredAt: new Date(),
+        metadata: {
+          ...metadata,
+          handoffReason: reason,
+          triggerContext: {
+            triggerSource: "worker",
+            triggerHandler: "handoffExecutor",
+            triggerType: source,
+          },
+        },
+      })
+      return { status: "handedOff" }
+    } catch (error) {
+      const normalizedError = normalizeError(error)
+      baseLogger.error(
+        { err: normalizedError, conversationId },
+        "[handoff-executor] Handoff execution failed",
+      )
+      throw error
+    }
+  }
+}
+
+export const handoffExecutorService = new HandoffExecutorService()
